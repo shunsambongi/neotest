@@ -7,9 +7,8 @@ local lib = require("neotest.lib")
 ---@field private _started boolean
 ---@field private _state neotest.ClientState
 ---@field private _events neotest.EventProcessor
----@field private _processes neotest.ProcessTracker
 ---@field private _files_read table<string, boolean>
----@field private _adapters table<integer, neotest.Adapter>
+---@field private _adapters table<string, neotest.Adapter>
 ---@field private _adapter_group neotest.AdapterGroup
 ---@field private _runner neotest.TestRunner
 local NeotestClient = {}
@@ -26,7 +25,6 @@ function NeotestClient:new(adapters)
     _events = events,
     _adapter_group = adapters,
     _state = state,
-    _processes = processes,
     _files_read = {},
     listeners = events.listeners,
     _runner = runner,
@@ -78,8 +76,7 @@ function NeotestClient:stop(position, args)
     lib.notify("No running process found", "warn")
     return
   end
-  local running_process_root = self._runner:get_process_key(position, adapter_id)
-  self._processes:stop(running_process_root)
+  self._runner:stop(position, adapter_id)
 end
 
 ---Attach to the given running position.
@@ -94,11 +91,7 @@ function NeotestClient:attach(position, args)
     lib.notify("No running process found", "warn")
     return
   end
-  local running_process_root = self._runner:get_process_key(position, adapter_id)
-  if self._processes:attach(running_process_root) then
-    logger.debug("Attached to process", running_process_root, "for position", position:data().id)
-    return
-  end
+  self._runner:attach(position, adapter_id)
 end
 
 ---@async
@@ -240,10 +233,6 @@ function NeotestClient:_update_positions(path, args)
     logger.error("Couldn't find positions in path", path, positions)
     return
   end
-  local existing = self:get_position(path, { refresh = false, adapter = adapter_id })
-  if positions:data().type == "file" and existing and #existing:children() == 0 then
-    self:_propagate_results_to_new_positions(adapter_id, positions)
-  end
   self._state:update_positions(adapter_id, positions)
   if positions:data().type == "dir" then
     local tree = self._state:positions(adapter_id, path)
@@ -299,38 +288,12 @@ end
 
 ---@private
 ---@async
-function NeotestClient:_propagate_results_to_new_positions(adapter_id, tree)
-  local new_results = {}
-  local results = self:get_results(adapter_id)
-  for _, pos in tree:iter() do
-    new_results[pos.id] = results[pos.id]
-  end
-  self._runner:collect_results(tree, new_results)
-  if not vim.tbl_isempty(new_results) then
-    self._state:update_results(adapter_id, new_results)
-  end
-end
-
----@private
----@async
 function NeotestClient:_set_focused_file(path)
   local adapter_id = self:get_adapter(path)
   if not adapter_id then
     return
   end
   self._state:update_focused_file(adapter_id, path)
-end
-
-function NeotestClient:_set_focused_position(path, row)
-  local adapter_id = self:get_adapter(path)
-  if not adapter_id then
-    return
-  end
-  local pos, pos_adapter_id = self:get_nearest(path, row)
-  if not pos then
-    return
-  end
-  self._state:update_focused_position(pos_adapter_id, pos:data().id)
 end
 
 ---@private
@@ -392,22 +355,29 @@ function NeotestClient:_start()
   autocmd({ "CursorHold", "BufEnter" }, function()
     local path, line = vim.fn.expand("<afile>:p"), vim.fn.line(".")
     async.run(function()
-      self:_set_focused_position(path, line - 1)
+      local pos, pos_adapter_id = self:get_nearest(path, line - 1)
+      if not pos then
+        return
+      end
+      self._state:update_focused_position(pos_adapter_id, pos:data().id)
     end)
   end)
 
   self:_update_adapters(async.fn.getcwd())
-  -- If discovery is not enabled, we need to update positions for all open
-  -- buffers on startup
+
   if not config.discovery.enabled then
-    for _, bufnr in ipairs(async.api.nvim_list_bufs()) do
-      local file_path = async.api.nvim_buf_get_name(bufnr)
-      self:_update_positions(file_path)
-    end
+    self:_update_open_buf_poisitions()
   end
   local end_time = async.fn.localtime()
   logger.info("Initialisation finished in", end_time - start, "seconds")
   self:_set_focused_file(async.fn.expand("%:p"))
+end
+
+function NeotestClient:_update_open_buf_poisitions()
+  for _, bufnr in ipairs(async.api.nvim_list_bufs()) do
+    local file_path = async.api.nvim_buf_get_name(bufnr)
+    self:_update_positions(file_path)
+  end
 end
 
 ---@private
@@ -444,10 +414,7 @@ function NeotestClient:_update_adapters(path)
   end
 end
 
----@param events? neotest.EventProcessor
----@param state? neotest.ClientState
----@param processes? neotest.ProcessTracker
 ---@return neotest.InternalClient
-return function(adapter_group, events, state, processes)
-  return NeotestClient:new(adapter_group, events, state, processes)
+return function(adapter_group)
+  return NeotestClient:new(adapter_group)
 end
